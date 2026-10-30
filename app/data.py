@@ -84,12 +84,46 @@ def parse_event(ev, slug):
         return None
 
 
+class Rejected(Exception):
+    """ESPN answered 400 Bad Request: the date window or parameters were not accepted."""
+
+
+_span = {}          # slug -> largest date window (days) ESPN has accepted
+_use_limit = {}     # slug -> whether the 'limit' parameter is accepted
+
+
+def _get(slug, a, b):
+    dates = f"{a:%Y%m%d}" if a.date() == b.date() else f"{a:%Y%m%d}-{b:%Y%m%d}"
+    options = [True, False] if _use_limit.get(slug, True) else [False]
+    for with_limit in options:
+        params = {"dates": dates, "limit": 300} if with_limit else {"dates": dates}
+        r = _session.get(ESPN_URL.format(slug=slug), params=params, timeout=20)
+        if r.status_code == 400:
+            continue
+        r.raise_for_status()
+        _use_limit[slug] = with_limit
+        events = r.json().get("events", [])
+        return [row for row in (parse_event(e, slug) for e in events) if row]
+    raise Rejected(f"ESPN rejected dates={dates} for {slug}")
+
+
 def fetch_range(slug, start, end):
-    params = {"dates": f"{start:%Y%m%d}-{end:%Y%m%d}", "limit": 1000}
-    r = _session.get(ESPN_URL.format(slug=slug), params=params, timeout=20)
-    r.raise_for_status()
-    events = r.json().get("events", [])
-    return [row for row in (parse_event(e, slug) for e in events) if row]
+    """Fetch [start, end], shrinking the window (30 -> 7 -> 1 day) whenever ESPN rejects it."""
+    span = _span.get(slug, CHUNK_DAYS)
+    rows, cur = [], start
+    while cur <= end:
+        nxt = min(cur + timedelta(days=span - 1), end)
+        try:
+            rows += _get(slug, cur, nxt)
+            cur = nxt + timedelta(days=1)
+            if span < CHUNK_DAYS:
+                time.sleep(0.05)
+        except Rejected:
+            if span == 1:
+                raise
+            span = max(1, span // 4)
+            _span[slug] = span
+    return rows
 
 
 # ---------------------------------------------------------------- sync
@@ -108,7 +142,7 @@ def sync_slug(con, slug, force=False):
     n, cur = 0, start
     try:
         while cur < end:
-            nxt = min(cur + timedelta(days=CHUNK_DAYS), end)
+            nxt = min(cur + timedelta(days=CHUNK_DAYS - 1), end)
             rows = fetch_range(slug, cur, nxt)
             con.executemany("""INSERT OR REPLACE INTO matches VALUES
                 (:id,:slug,:date,:home_id,:home,:away_id,:away,:hg,:ag,:state,:completed,:neutral)""", rows)
